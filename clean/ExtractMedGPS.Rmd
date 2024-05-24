@@ -1,0 +1,291 @@
+---
+title: "Get Index Visit Data from MedGPS"
+author: "Nathalie Germain"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+### Read in the key file
+
+```{r Install Packages}
+p = c("tidyverse", "excel.link", "readxl", "writexl", "readr", "data.table", "stringi")
+lapply(p, FUN = function(X) {
+    do.call("require", list(X)) 
+})
+
+key_file <- read_csv("E:/MSc/Clean MedGPS/Index Visit Key File Updated.csv") %>%
+  rename(nam = `No d'assurance maladie (Dossier usager)`)
+```
+
+```{r Change variable types: Dates}
+datetime_columns <- c(
+  "debut_index",
+  "sortie_index"
+)
+
+for (col in datetime_columns) {
+  key_file[[col]] <- as.POSIXct(key_file[[col]], format = "%Y-%m-%d %H:%M", tz = "EST")
+}
+```
+
+### Read in all MedGPS data
+
+```{r Read in all raw files}
+setwd("E:/MSc/Clean MedGPS/in")
+  data <-
+    list.files(pattern = "*.csv") %>% 
+    map_df(~read_csv(., col_types = cols(.default = "c")))
+```
+
+#### Clean up the accents
+
+```{r}
+dt = data
+# write.csv(dt, "E:/MSc/Clean MedGPS/out/MGPsData.csv")
+```
+
+```{r}
+# Fix stupid accents
+r <- list(
+  "Ã€" = "À",
+  "Ã‚" = "Â",
+  "Ã„" = "Ä",
+  "Ã‡" = "Ç",
+  "Ãˆ" = "È",
+  "Ã‰" = "É",
+  "ÃŠ" = "Ê",
+  "Ã‹" = "Ë",
+  "ÃŒ" = "Ì",
+  "Ã’" = "Ò",
+  "Ã“" = "Ó",
+  "Ã”" = "Ô",
+  "Ã™" = "Ù",
+  "Ãš" = "Ú",
+  "Ã›" = "Û",
+  "Ãœ" = "Ü",
+  "Ã¡" = "á",
+  "Ã¢" = "â",
+  "Ã£" = "ã",
+  "Ã¤" = "ä",
+  "Ã¦" = "æ",
+  "Ã§" = "ç",
+  "Ã¨" = "è",
+  "Ã©" = "é",
+  "Ãª" = "ê",
+  "Ã«" = "ë",
+  "Ã¬" = "ì",
+  "Ã®" = "î",
+  "Ã¯" = "ï",
+  "Ã²" = "ò",
+  "Ã³" = "ó",
+  "Ã´" = "ô",
+  "Ã¹" = "ù",
+  "Ãº" = "ú",
+  "Ã»" = "û",
+  "Ã¼" = "ü",
+  "Ã" = "à"
+)
+
+for (key in names(r)) {
+  dt[] <- lapply(dt, function(x) ifelse(grepl(key, x, perl = TRUE), gsub(key, r[[key]], x, perl = TRUE), x))
+}
+
+colnames(dt) <- lapply(colnames(dt), function(x) {
+  for (key in names(r)) {
+    if (grepl(key, x, perl = TRUE)) {
+      x <- gsub(key, r[[key]], x, perl = TRUE)
+    }
+  }
+  return(x)
+})
+
+out <- dt %>% mutate_all(~ stri_replace_all_regex(., "\\s+", " "))
+dt = out
+```
+
+
+
+```{r Import data 10,000 lines at a time, clean it, and keep correct NAMs}
+# chunk_size <- 10000
+# dt <- data.table()
+# header <- readLines("D.csv", n = 1)
+# col_names <- strsplit(header, ",")[[1]]
+# 
+# for (i in seq(1, 742549, by = chunk_size)) {
+#   chunk <- fread("D.csv", header = FALSE, skip = i - 1, nrow = chunk_size, col.names = col_names)
+#   dt <- rbindlist(list(dt, chunk))
+# }
+# # Takes a moment to execute
+# dt <- dt[-1, ]
+
+datetime_columns <- c(
+  "Date de début (Visite) (Date et heure)",
+  "Date de fin (Visite) (Date et heure)"
+)
+
+for (col in datetime_columns) {
+  dt[[col]] <- as.POSIXct(dt[[col]], format = "%Y-%m-%d %H:%M", tz = "EST")
+}
+
+numeric_columns <- c(
+  "Durée occupation civière (hres) (Civière)",
+  "Âge (ans) (Visite)",
+  "Délai avant premier triage (hres) (Visite)",
+  "Durée séjour (hres) (Visite)",
+  "Temps sur civière (hres) (Visite)"
+)
+
+for (col in numeric_columns) {
+  dt[[col]] <- as.numeric(dt[[col]])
+}
+
+da = dt # keep a spare copy handy in case of mistakes
+dt <- dt[dt$`No d'assurance maladie (Dossier usager)` %in% key_file$nam, ]
+```
+
+```{r}
+dt <- dt %>%
+  left_join(key_file %>% select("nam", "sortie_index", "debut_index"),
+            by = c("No d'assurance maladie (Dossier usager)" = "nam"))
+```
+
+### Identify the index visit in all of the MedGPS data
+
+There are some duplicates, because it is possible patients presented to the ED, had a provisional diagnosis, and then had their file re-opened. 
+
+```{r}
+dt$Index <- (dt$`Date de fin (Visite) (Date et heure)` == dt$sortie_index) &
+            (dt$`Date de début (Visite) (Date et heure)` == dt$debut_index) &
+            #(dt$`Autonomie après triage description (Triage)` == "Civière") #&
+            (dt$`Orientation description (Visite)` == "Retour à domicile")
+```
+
+Below, the TRUE value should contain 5016 values. 
+
+```{r}
+dt <- dt %>%
+  select(-c(`Durée occupation civière (hres) (Civière)`, `Type diagnostic code (Visite)`, 
+            `Type diagnostic description (Visite)`, `Diagnostic description (Visite)`,
+            `Diagnostic code (Visite)`, `Douleur (Triage)`)) %>% distinct()
+            # `Autonomie après triage description (Triage)`,
+            # `Priorite de triage (Triage)`)) 
+table(dt$Index)
+```
+
+If this does not return zero it means the program identified more than one index visit per person. 
+
+```{r}
+filtered_dt <- dt %>%
+  group_by(`No d'assurance maladie (Dossier usager)`) %>%
+  filter(sum(Index == TRUE) >= 2) %>%
+  filter(Index == TRUE) %>%
+  ungroup()
+dim(filtered_dt)[1]
+```
+
+```{r Clean up environment}
+rm(list = c("r", "a", "data", "filtered_dt", "da", "out"))
+gc()
+```
+
+There should be no patients with NO index visit. 
+
+```{r}
+unique(dt$`No d'assurance maladie (Dossier usager)`[!dt$`No d'assurance maladie (Dossier usager)` %in% dt$`No d'assurance maladie (Dossier usager)`[dt$Index]])
+```
+### Calculate date-time outcome variables
+
+```{r X days past or before index visit}
+dt$Index30 <- dt$sortie_index + days(31)
+dt$Index365 <- dt$sortie_index - days(366)
+dt <- dt %>% distinct() # in case of duplicates
+```
+
+#### Identify revisits
+
+Identify how many visits to the ED occurred in the 365 days prior to the index visit, correcting for the index visit.
+
+```{r}
+dt$EDvisit365 <- FALSE
+dt$EDrevisit30 <- FALSE
+dt$EDrevisitDays <- numeric(nrow(dt))
+
+for (i in 1:nrow(dt)) {
+  dt$EDrevisit30[i] <- ifelse(dt$`Date de début (Visite) (Date et heure)`[i] >= dt$sortie_index[i] & dt$`Date de début (Visite) (Date et heure)`[i] <= dt$Index30[i], TRUE, FALSE)
+  dt$EDrevisitDays[i] <- as.numeric(difftime(dt$`Date de début (Visite) (Date et heure)`[i], dt$sortie_index[i], units = "days"))
+}
+```
+
+`dt` contains all ED visits in the observation period. 
+`dtp` contains all ED visits AFTER each patient's index visit only AND the index visit. 
+
+#### Identify frequent/heavy ED users
+
+Identify how many times patients went to the ED in the last 365 days before the index visit.
+
+`Visits365` is a count of the number of ED visits in the last year. 
+
+```{r}
+
+for (i in 1:nrow(dt)) {
+  dt$EDvisit365[i] <- ifelse(dt$`Date de début (Visite) (Date et heure)`[i] <= dt$sortie_index[i] & dt$`Date de début (Visite) (Date et heure)`[i] >= dt$Index365[i], TRUE, FALSE)
+}
+
+dt <- dt %>%
+  group_by(`No d'assurance maladie (Dossier usager)`) %>%
+  mutate(Visits365 = sum(EDvisit365, na.rm = TRUE) - 1) %>% # -1 corrects for the index visit
+  ungroup()
+```
+
+#### Identify re-visits
+
+Keep a dataframe with only the index visit and any visits after. 
+
+`EDrevisit30` is a boolean variable identifying whether or not a 30 day re-visit occurred. 
+
+```{r}
+dtp <- subset(dt, dt$EDrevisitDays >= 0 | dt$Index == TRUE)
+```
+
+#### Neat and tidy
+
+Keep only relevant information along with the NEXT soonest ED revisit, if there was a revisit. 
+
+```{r}
+d <- dtp %>% select(id_record, `Sexe description (Dossier usager)`, 
+                    `No d'assurance maladie (Dossier usager)`,
+                    `Date de début (Visite) (Date et heure)`,                                       `Date de fin (Visite) (Date et heure)`,                     
+                    `Âge (ans) (Visite)`,
+                    `Orientation description (Visite)`,
+                    `Temps sur civière (hres) (Visite)`,
+                    `Priorite de triage (Triage)`,
+                    `Autonomie après triage description (Triage)`,
+                    `CMD description (Visite)`,
+                    Index, Visits365, EDrevisitDays, EDrevisit30)
+```
+
+```{r}
+indexes <- d %>% filter(Index == TRUE)
+revisits <- d %>% filter(EDrevisitDays >= 0)
+f <- data.frame()
+for (id in unique(revisits$id_record)) {
+subset_data <- revisits[revisits$id_record == id, ]
+min_EDrevisitDays <- min(subset_data$EDrevisitDays)
+f <- rbind(f, subset_data[subset_data$EDrevisitDays == min_EDrevisitDays, ])
+}
+f <- f %>%
+  select(-c(`Sexe description (Dossier usager)`, 
+            `No d'assurance maladie (Dossier usager)`, 
+            `Âge (ans) (Visite)`))
+```
+
+```{r}
+a <- merge(indexes, f, by = "id_record", all.x = TRUE, suffixes = c("", "_revisit"))
+```
+
+```{r Save data}
+save(a, dt, indexes, revisits, key_file, file = "E:/MSc/Clean MedGPS/MedGpsCleaned.RData")
+```
+
