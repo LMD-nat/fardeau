@@ -1,0 +1,441 @@
+---
+title: "Analyze 30-day ED admissions"
+output:
+  word_document: 
+    highlight: tango
+  html_document:
+    df_print: paged
+---
+
+```{r Import, message=FALSE, warning=FALSE, echo=FALSE, results = FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+# Clear the environment
+rm(list=ls())
+
+# Load all the packages in one shot
+x <- c("tidyverse", "aod", "lubridate", "readr", "readxl", "table1", 
+       "ggplot2", "MASS", "lmtest", "magrittr")
+lapply(x, FUN = function(X) {
+    do.call("require", list(X)) 
+})
+
+# Import data
+r <- read_rds("~/Desktop/ready.RData")
+```
+
+
+
+### Step 1. Univariate analyses of continuous variables.
+
+```{r Import the admission data, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+adm <- read_excel("admission_data.xlsx")
+#rec <- read_csv("pa-recruitment.csv")
+r2 <- left_join(r, adm, by = 'id_record')
+#r3 <- left_join(r2, rec, by = 'id_record')
+```
+
+Hosmer and Lemeshow recommend removing variables for which the p-value describing the association with the outcome is less than or equal to 0.25.
+
+```{r Keep predictive variables only, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+r1 <- r2 %>% dplyr::select(admission, zbi_score, pt_sex , pt_age,             
+arrival_method, triage, hospital, time_stretcher_hrs, 
+triage_delay, provenance,  Visits365,         
+soutien_social, period, charlson_score_adj, 
+cg_sex, med_fam, rv_med_fam, transport, pt_education, cg_education, cg_pt_relation, pt_revenue, cg_revenue, pt_residence, cg_residence)
+dependent_variable <- "admission"
+
+r1 <- r1 %>%
+  mutate(cg_residence = case_when(
+    cg_residence == "Home" ~ "home, alone",
+    cg_residence == "Home, alone" ~ "home, shared",
+    TRUE ~ cg_residence  # Keeps other values unchanged
+  ))
+
+r1 <- r1 %>%
+  mutate(pt_residence = case_when(
+    pt_residence == "Home" ~ "care home",
+    pt_residence == "Home, alone" ~ "home, shared",
+    pt_residence == "Care home" ~ "home, alone"
+  ))
+
+r1$cg_residence <- factor(r1$cg_residence, levels = c("home, shared", "home, alone", "Care home"))
+r1$pt_residence <- factor(r1$pt_residence, levels = c("home, shared", "home, alone", "care home")) 
+
+# Get the names of predictor variables (all columns except the dependent variable)
+predictor_variables <- setdiff(names(r1), dependent_variable)
+
+# Perform glm and extract coefficients for each predictor variable
+results <- lapply(predictor_variables, function(predictor) {
+  model <- glm(paste(dependent_variable, "~", predictor), data = r1, family = 'binomial')
+  coef_values <- coef(model)
+  p_values <- coef(summary(model))[, 'Pr(>|z|)']
+  
+  # Exclude intercept values
+  coef_values <- coef_values[-1]
+  p_values <- p_values[-1]
+  
+  result <- data.frame(
+    Predictor = predictor,
+    Coefficient = coef_values,
+    P_Value = p_values
+  )
+  
+  return(result)
+})
+
+# Combine the results into a single data frame
+results_df <- do.call(rbind, results)
+
+# Print names of variables where p-value is less than or equal to 0.25
+significant_variables <- results_df$Predictor[results_df$P_Value <= 0.25]
+cat("Variables with p-value less than or equal to 0.25:", paste(significant_variables, collapse = ', '))
+
+# Fix
+r2$triage_delay[is.na(r1$triage_delay)] <- 0
+```
+
+### Step 2. Fit a model with all covariates identified at Step 1.
+
+#### Step 2.1. Run an empty model. 
+
+```{r Empty model, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+r1 <- r2 %>% dplyr::select(admission, zbi_score, arrival_method, triage, hospital, triage_delay, Visits365, period, charlson_score_adj, pt_revenue, cg_revenue)
+
+empty_model <- glm(admission ~ NULL, data = r1, family = "binomial", na.action = na.exclude)
+summary(empty_model)
+```
+
+```{r Check for multicoliniearity, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+library(car)
+colinear_check <- r1 %>%
+  dplyr::select_if(is.numeric) %>%
+  dplyr::select(-admission)
+
+# Find correlations of highly correlated numeric variables
+cor_matrix <- cor(colinear_check)
+
+# Use the Variable Inflation Factor (VIF) for all variables
+# High VIF values (typically greater than 5 or 10) suggest collinearity.
+vif_results <- vif(glm(admission ~ ., data = r1, family = "binomial"))
+
+cor_matrix
+vif_results
+```
+
+According to VIF estimates and correlations, no variables are problematic. 
+
+#### Step 2.3. Fit a model with all covariates identified at Step 1.
+
+```{r Fit a base model, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+base_model <- glm(admission ~ zbi_score + arrival_method + triage + hospital + triage_delay + Visits365 + period + charlson_score_adj + pt_revenue + cg_revenue, data = r1, family = "binomial", na.action = na.exclude)
+
+library(lmtest)
+### need to beat the p-value threshold of .05
+lrtest(empty_model, base_model)
+summary(base_model)
+```
+
+The base model fits the data much better than the empty model. We will continue with the base model. 
+
+## Step 3. Iteratively reduce the model and check for the effects of confounding variables.
+
+```{r Model 2, tidy=TRUE, tidy.opts=list(width.cutoff=50)} 
+m2 <- glm(admission ~ zbi_score + arrival_method + triage + hospital + Visits365 + period + charlson_score_adj + pt_revenue + cg_revenue, data = r1, family = "binomial")
+
+# Likelihood Ratio Test
+lrtest(base_model, m2)
+summary(m2)
+
+# AND check for changes of 20% or more to beta values, which indicates confounding
+
+m1_summary <- as.data.frame(broom::tidy(base_model))
+m2_summary <- as.data.frame(broom::tidy(m2))
+
+m1m2 <- dplyr::left_join(
+  m1_summary,
+  m2_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m1", ".m2")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m1, estimate.m2) %>%
+  dplyr::mutate(
+    change = estimate.m1 - estimate.m2,
+    twenty_percent = abs(estimate.m1) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+
+print(m1m2)
+```
+
+The higher the value of the log-likelihood, the better a model fits a dataset. The new model and the original model fit the data equally well (p > .05), but the base model performs slightly better with log likelihood (but not with AIC). Thus, we could use the reduced model because the additional predictor variables in the full model don't offer a significant improvement in fit.
+
+Next, we have to check that the coefficients have not been affected by the removal of patient sex. We check this by making sure the coefficients for each variable kept have not changed more than 20%.This appears to have been met and as such there is no evidence that patient sex confounds the other variables. So, we continue removing variables iteratively. 
+
+```{r Model 3, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m3 <- glm(admission ~ zbi_score + arrival_method + triage + hospital + period + charlson_score_adj + pt_revenue + cg_revenue, data = r1, family = "binomial")
+
+summary(m3)
+
+# Likelihood Ratio Test
+lrtest(m2, m3)
+
+m2_summary <- as.data.frame(broom::tidy(m2))
+m3_summary <- as.data.frame(broom::tidy(m3))
+
+m1m2 <- dplyr::left_join(
+  m2_summary,
+  m3_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m2", ".m3")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m2, estimate.m3) %>%
+  dplyr::mutate(
+    change = estimate.m2 - estimate.m3,
+    twenty_percent = abs(estimate.m2) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+
+print(m1m2)
+```
+
+```{r Model 4, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m4 <- glm(admission ~ arrival_method + triage + hospital + period + charlson_score_adj + pt_revenue + cg_revenue, data = r1, family = "binomial")
+summary(m4)
+lrtest(m3, m4)
+
+m4_summary <- as.data.frame(broom::tidy(m4))
+m3_summary <- as.data.frame(broom::tidy(m3))
+
+m1m2 <- dplyr::left_join(
+  m3_summary,
+  m4_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m3", ".m4")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m3, estimate.m4) %>%
+  dplyr::mutate(
+    change = estimate.m3 - estimate.m4,
+    twenty_percent = abs(estimate.m3) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+
+print(m1m2)
+```
+
+Again, the 4th category of period seems to be affected, but I think it's an artifact. Next we will remove patient age. 
+
+```{r Model 5, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m5 <- glm(admission ~ arrival_method + triage + hospital + charlson_score_adj + pt_revenue + cg_revenue, data = r1, family = "binomial")
+summary(m5)
+lrtest(m4, m5)
+
+m4_summary <- as.data.frame(broom::tidy(m4))
+m5_summary <- as.data.frame(broom::tidy(m5))
+
+m1m2 <- dplyr::left_join(
+  m4_summary,
+  m5_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m4", ".m5")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m4, estimate.m5) %>%
+  dplyr::mutate(
+    change = estimate.m4 - estimate.m5,
+    twenty_percent = abs(estimate.m4) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+
+print(m1m2)
+```
+
+```{r Compare models, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+models <- list(m2, m3, m4, m5)
+summaries <- lapply(models, summary)
+summaries 
+# Likelihood Ratio Tests
+lrtest(base_model, m5) 
+lrtest(empty_model, m5)
+```
+
+## Step 4. Add variables back into the model ##
+
+Model M9 appears to be the most reduced model without experiencing moderation by removing variables. 
+
+Next, add each variable not selected in Step 1 to the model obtained at the conclusion of cycling through Step 2 and Step 3, one at a time, and check its significance either by the Wald statistic p-value or the partial likelihood ratio test, if it is a categorical variable with more than two levels.
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+### Variables we did not select
+
+# used <- c(admission, zbi_score, arrival_method, triage, hospital, triage_delay, Visits365, period, charlson_score_adj, pt_revenue, cg_revenue)
+
+#not used
+vars <- c('pt_sex' , 'pt_age', 'time_stretcher_hrs', 'provenance', 'soutien_social', 'cg_sex', 'med_fam', 'rv_med_fam', 'transport', 'pt_education', 'cg_education', 'cg_pt_relation', 'pt_residence', 'cg_residence')      
+
+ma <- glm(EDrevisit30 ~ zbi_score +
+    Visits365, family = "binomial", data = r2)
+
+model_list <- list()
+
+### Run the models one by one, adding one of the vars as a predictor each time
+for (i in seq_along(vars)) {
+  formula <- as.formula(paste("admission ~ arrival_method + triage + hospital + charlson_score_adj + pt_revenue + cg_revenue +", vars[i]))
+  model <- glm(formula, data = r2, family = "binomial")
+  assign(paste0("ma", i), model)
+}
+
+### Print the model summaries with the Wald Tests
+for (i in seq_along(vars)) {
+  model_name <- paste0("ma", i)
+  model_summary <- summary(get(model_name))
+  print(paste("Summary for", model_name))
+  print(model_summary)
+}
+
+### Likelihood Ratio Tests
+for (i in seq_along(vars)) {
+  model_name <- paste0("ma", i)
+  model_summary <- lrtest(m5, get(model_name))
+  print(paste("LRT Result for", model_name))
+  print(model_summary)
+}
+```
+
+None of these new added variables are statistically significant. None of these new variables add new information to the model. 
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int8 <- glm(admission ~ arrival_method + zbi_score + charlson_score_adj + cg_revenue, family = "binomial", data = r1)
+summary(m_int8)
+#lrtest(m_int7, m_int8)
+```
+
+## Step 5. Check Assumptions of linearity ##
+
+```{r Assumption of linearity, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+### Scatterplots
+# Run logistic regression model
+logit_model <- m_int8
+
+# Save logit scores as a new variable in the dataset
+r1$logit_scores <- predict(logit_model, type = "link")
+
+# Create scatterplots for each continuous IV against logit scores
+par(mfrow = c(2, ceiling(length(c('charlson_score_adj'))/2)), mar = c(3, 3, 2, 1))
+
+for (iv in c('charlson_score_adj')) {
+  plot(r1[[iv]], r1$logit_scores, main = paste("Scatterplot of", iv, "against Logit Scores"), xlab = iv, ylab = "Logit Scores")
+}
+```
+## Step 6. Look for interactions ##
+
+The next step in the purposeful selection procedure is to explore possible interactions among the main effects. Each pair of main effects should represent a plausible interaction. Hence, we fit models that individually added possible interactions to the main effects model.
+
+An interaction between two variables implies that the effect of each variable is not constant over levels of the other variable.
+
+In the textbook, they specify this threshold as .10 when looking for interactions, and then as .05 when evaluating them.  
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int <- glm(admission ~ triage*arrival_method + hospital*arrival_method + 
+    charlson_score_adj*arrival_method + pt_revenue*arrival_method + cg_revenue*arrival_method, 
+    family = "binomial", data = r1)
+summary(m_int)
+```
+
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int2 <- glm(admission ~ arrival_method*triage + hospital*triage + charlson_score_adj*triage  + pt_revenue*triage + cg_revenue*triage, 
+    family = "binomial", data = r1)
+summary(m_int2)
+```
+There is an interaction of patient revenue and hospital site. 
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int3 <- glm(admission ~ arrival_method*hospital + triage*hospital + charlson_score_adj*hospital  + pt_revenue*hospital + cg_revenue*hospital, 
+    family = "binomial", data = r1)
+summary(m_int3)
+```
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int4 <- glm(admission ~ arrival_method*charlson_score_adj + triage*charlson_score_adj + hospital*charlson_score_adj  + pt_revenue*charlson_score_adj + cg_revenue*charlson_score_adj, family = "binomial", data = r1)
+summary(m_int4)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int5 <- glm(admission ~ arrival_method*pt_revenue + charlson_score_adj*pt_revenue + triage*pt_revenue + hospital*pt_revenue + cg_revenue*pt_revenue, family = "binomial", data = r1)
+summary(m_int5)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int6 <- glm(admission ~ arrival_method*cg_revenue + charlson_score_adj*cg_revenue + triage*cg_revenue + hospital*cg_revenue + cg_revenue*pt_revenue, family = "binomial", data = r1)
+summary(m_int6)
+```
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int7 <- glm(admission ~ arrival_method+ charlson_score_adj + triage + hospital*pt_revenue + cg_revenue, family = "binomial", data = r1)
+summary(m_int7)
+lrtest(m_int7, m5) # m_int7 is best, but there are no main effects of hospital, so it needs to go
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int8 <- glm(admission ~ arrival_method + zbi_score + charlson_score_adj + cg_revenue, family = "binomial", data = r1)
+summary(m_int8)
+#lrtest(m_int7, m_int8)
+```
+
+
+## Step 7. Assess Goodness of Fit ##
+
+In the Hosmer-Lemeshow model, a large value of Chi-squared (with small p-value \< 0.05) indicates poor fit and small Chi-squared values (with larger p-value closer to 1) indicate a good logistic regression model fit.
+
+The g in the formula represents the groups, such that g = 10 means we are splitting the data into 10 groups based on their predicted probabilities and then, within groups, comparing the observed and expected proportions.
+
+```{r Goodness of fit, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+library(ResourceSelection)
+# Check the model fit across all the individuals
+fit <- m_int8$fitted
+hist(fit)
+
+### Method 1: Do it by hand!
+# Calculate the residuals
+# Sum of squares of these residuals follows a chi-square with 1406 df
+
+r <- (r1$EDrevisit30-fit)/(sqrt(fit*(1-fit)))
+sum(r^2)
+1-pchisq(sum(r^2), df=1376) # not significant
+
+### Method 2 for Goodness of Fit: 
+hl_gof <- hoslem.test(r1$admission, fitted(m_int8), g = 10)
+hl_gof
+```
+
+So model m_int7 is the final adjusted model predicting 30 day admissions. 
+
+```{r C-Statistic and ROC curve, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+library(DescTools)
+library(pROC)
+Cstat(m_int8)
+
+predictions <- predict(m_int8, type = "response")
+roc(r1$admission, predictions)
+
+# Roc Curve
+roca30 <- ggroc(roc(r1$admission, predictions), colour = "darkmagenta") +
+  theme_minimal() + 
+  ggtitle("ED Admissions at 30 days as Predicted by Model") + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color = "grey", linetype = "dashed")
+
+# C statistics
+survival::concordance(m_int8)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+save(roca30, file = "roca30.RData")
+```

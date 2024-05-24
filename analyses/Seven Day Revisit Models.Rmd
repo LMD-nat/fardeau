@@ -1,0 +1,569 @@
+---
+title: "Analyze 7-day ED revisits"
+output:
+  word_document: 
+    highlight: pygments
+  html_notebook: default
+---
+
+```{r Import, message=FALSE, warning=FALSE, echo=FALSE, results = FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+# Clear the environment
+rm(list=ls())
+
+# Load all the packages in one shot
+x <- c("tidyverse", "aod", "lubridate", "readr", "readxl", "table1", 
+       "ggplot2", "MASS", "lmtest", "magrittr")
+lapply(x, FUN = function(X) {
+    do.call("require", list(X)) 
+})
+
+# Import data
+r <- read_rds("~/Desktop/ready.RData")
+```
+
+### Step 1. Univariate analyses of continuous variables.
+
+Hosmer and Lemeshow recommend removing variables for which the p-value describing the association with the outcome is less than or equal to 0.25.
+
+```{r Keep predictive variables only, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+r1 <- r %>% dplyr::select(EDrevisit7, zbi_score, pt_sex, pt_age, arrival_method, triage, time_stretcher_hrs, transport, hospital, provenance, Visits365, period, cg_education, pt_residence, cg_residence)
+dependent_variable <- "EDrevisit7"
+
+r1 <- r1 %>%
+  mutate(cg_residence = case_when(
+    cg_residence == "Home" ~ "home, alone",
+    cg_residence == "Home, alone" ~ "home, shared",
+    TRUE ~ cg_residence  # Keeps other values unchanged
+  ))
+
+r1 <- r1 %>%
+  mutate(pt_residence = case_when(
+    pt_residence == "Home" ~ "care home",
+    pt_residence == "Home, alone" ~ "home, shared",
+    pt_residence == "Care home" ~ "home, alone"
+  ))
+
+r1$cg_residence <- factor(r1$cg_residence, levels = c("home, shared", "home, alone", "Care home"))
+r1$pt_residence <- factor(r1$pt_residence, levels = c("home, shared", "home, alone", "care home"))
+
+# Get the names of predictor variables (all columns except the dependent variable)
+predictor_variables <- setdiff(names(r1), dependent_variable)
+
+# Perform glm and extract coefficients for each predictor variable
+results <- lapply(predictor_variables, function(predictor) {
+  model <- glm(paste(dependent_variable, "~", predictor), data = r1, family = 'binomial')
+  coef_values <- coef(model)
+  p_values <- coef(summary(model))[, 'Pr(>|z|)']
+  
+  # Exclude intercept values
+  coef_values <- coef_values[-1]
+  p_values <- p_values[-1]
+  
+  result <- data.frame(
+    Predictor = predictor,
+    Coefficient = coef_values,
+    P_Value = p_values
+  )
+  
+  return(result)
+})
+
+# Combine the results into a single data frame
+results_df <- do.call(rbind, results)
+
+# Print names of variables where p-value is less than or equal to 0.25
+significant_variables <- results_df$Predictor[results_df$P_Value <= 0.25]
+cat("Variables with p-value less than or equal to 0.25:", paste(significant_variables, collapse = ', '))
+```
+
+### Step 2. Fit a model with all covariates identified at Step 1.
+
+Those covariates are `pt_sex`, `pt_age`, `arrival_method`, `provenance`, `triage`, `time_stretcher_hrs`, `Visits365`, `transport`, `period`, `pt_residence`, `cg_residence`, and `cg_education`. I will keep `zbi_score`, `pt_sex` and `pt_age` because they are clinically relevant variables. 
+
+#### Step 2.1. Run an empty model. 
+
+The empty model yields a mean of the distribution = -2.26 meaning there are many more zeroes than ones in the column "EDrevisit7".
+
+```{r Empty model, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+r1 <- r %>% dplyr::select(EDrevisit7, `pt_sex`, `pt_age`, `arrival_method`, `provenance`, `triage`, `time_stretcher_hrs`, `Visits365`, `transport`, `period`, `pt_residence`, `cg_residence`, `cg_education`, `zbi_score`, `pt_sex`, `pt_age`)
+
+empty_model <- glm(EDrevisit7 ~ NULL, data = r1, family = "binomial")
+summary(empty_model)
+```
+
+```{r Check for multicoliniearity, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+library(car)
+colinear_check <- r1 %>%
+  dplyr::select_if(is.numeric) %>%
+  dplyr::select(-EDrevisit7)
+
+# Find correlations of highly correlated numeric variables
+cor_matrix <- cor(colinear_check)
+
+# Use the Variable Inflation Factor (VIF) for all variables
+# High VIF values (typically greater than 5 or 10) suggest collinearity.
+vif_results <- vif(glm(EDrevisit7 ~ ., data = r1, family = "binomial"))
+
+cor_matrix
+vif_results
+```
+
+According to VIF estimates and correlations, no variables are problematic. 
+
+#### Step 2.3. Fit a model with all covariates identified at Step 1.
+
+```{r Fit a base model, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+base_model <- glm(EDrevisit7 ~ zbi_score + `pt_sex`+ `pt_age`+ `arrival_method`+ `provenance`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `transport`+ `period`+ `pt_residence`+ `cg_residence`+ `cg_education`, data = r1, family = "binomial")
+
+library(lmtest)
+### need to beat the p-value threshold of .05
+lrtest(empty_model, base_model)
+summary(base_model)
+```
+
+## Step 3. Iteratively reduce the model and check for the effects of confounding variables.
+
+```{r Model 2, tidy=TRUE, tidy.opts=list(width.cutoff=50)} 
+# remove provenance
+m2 <- glm(EDrevisit7 ~ zbi_score + `pt_sex`+ `pt_age`+ `arrival_method`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `transport`+ `period`+ `pt_residence`+ `cg_residence`+ `cg_education`, data = r1, family = "binomial")
+
+# Likelihood Ratio Test
+lrtest(base_model, m2)
+summary(m2)
+# This means the full model and the nested model fit the data equally well. Thus, we should use the nested model because the additional predictor variables in the full model don’t offer a significant improvement in fit.
+
+# AND check for changes of 20% or more to beta values, which indicates confounding
+
+m1_summary <- as.data.frame(broom::tidy(base_model))
+m2_summary <- as.data.frame(broom::tidy(m2))
+
+m1m2 <- dplyr::left_join(
+  m1_summary,
+  m2_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m1", ".m2")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m1, estimate.m2) %>%
+  dplyr::mutate(
+    change = estimate.m1 - estimate.m2,
+    twenty_percent = abs(estimate.m1) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+print(m1m2)
+```
+
+```{r Model 3, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+# Next, remove provenance
+m3 <- glm(EDrevisit7 ~ zbi_score + `pt_sex`+ `pt_age`+ `provenance`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `transport`+ `period`+ `pt_residence`+ `cg_residence`+ `cg_education`, data = r1, family = "binomial")
+
+summary(m3)
+
+# Likelihood Ratio Test
+lrtest(m2, m3)
+
+m2_summary <- as.data.frame(broom::tidy(m2))
+m3_summary <- as.data.frame(broom::tidy(m3))
+
+m1m2 <- dplyr::left_join(
+  m2_summary,
+  m3_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m2", ".m3")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m2, estimate.m3) %>%
+  dplyr::mutate(
+    change = estimate.m2 - estimate.m3,
+    twenty_percent = abs(estimate.m2) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+print(m1m2)
+```
+
+```{r Model 4, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m4 <- glm(EDrevisit7 ~ zbi_score + `pt_sex`+ `pt_age`+ `provenance`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `transport`+ `pt_residence`+ `cg_residence`+ `cg_education`, family = "binomial", data = r1)
+summary(m4)
+lrtest(m3, m4)
+
+m4_summary <- as.data.frame(broom::tidy(m4))
+m3_summary <- as.data.frame(broom::tidy(m3))
+
+m1m2 <- dplyr::left_join(
+  m3_summary,
+  m4_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m3", ".m4")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m3, estimate.m4) %>%
+  dplyr::mutate(
+    change = estimate.m3 - estimate.m4,
+    twenty_percent = abs(estimate.m3) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+print(m1m2)
+```
+
+```{r Model 5, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m5 <- glm(EDrevisit7 ~ zbi_score + `pt_sex`+ `pt_age`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `transport`+ `pt_residence`+ `cg_residence`+ `cg_education`, 
+    family = "binomial", data = r1)
+summary(m5)
+lrtest(m4, m5)
+
+m4_summary <- as.data.frame(broom::tidy(m4))
+m5_summary <- as.data.frame(broom::tidy(m5))
+
+m1m2 <- dplyr::left_join(
+  m4_summary,
+  m5_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m4", ".m5")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m4, estimate.m5) %>%
+  dplyr::mutate(
+    change = estimate.m4 - estimate.m5,
+    twenty_percent = abs(estimate.m4) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+
+print(m1m2)
+```
+
+
+```{r Model 6, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m6 <- glm(EDrevisit7 ~ zbi_score + `pt_sex`+ `pt_age`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `pt_residence`+ `cg_residence`+ `cg_education`, 
+    family = "binomial", data = r1)
+summary(m6)
+lrtest(m5, m6)
+
+m5_summary <- as.data.frame(broom::tidy(m5))
+m6_summary <- as.data.frame(broom::tidy(m6))
+
+m1m2 <- dplyr::left_join(
+  m5_summary,
+  m6_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m5", ".m6")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m5, estimate.m6) %>%
+  dplyr::mutate(
+    change = estimate.m5 - estimate.m6,
+    twenty_percent = abs(estimate.m5) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+
+print(m1m2)
+```
+
+```{r Model 7, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m7 <- glm(EDrevisit7 ~ `pt_sex`+ `pt_age`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `pt_residence`+ `cg_residence`+ `cg_education`, 
+    family = "binomial", data = r1)
+summary(m7)
+lrtest(m6, m7)
+
+m6_summary <- as.data.frame(broom::tidy(m6))
+m7_summary <- as.data.frame(broom::tidy(m7))
+
+m1m2 <- dplyr::left_join(
+  m6_summary,
+  m7_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m6", ".m7")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m6, estimate.m7) %>%
+  dplyr::mutate(
+    change = estimate.m6 - estimate.m7,
+    twenty_percent = abs(estimate.m6) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+print(m1m2)
+```
+
+
+```{r Model 8, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m8 <- glm(EDrevisit7 ~ `pt_sex`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `pt_residence`+ `cg_residence`+ `cg_education`, 
+    family = "binomial", data = r1)
+summary(m8)
+lrtest(m7, m8)
+
+m7_summary <- as.data.frame(broom::tidy(m7))
+m8_summary <- as.data.frame(broom::tidy(m8))
+
+m1m2 <- dplyr::left_join(
+  m7_summary,
+  m8_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m7", ".m8")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m7, estimate.m8) %>%
+  dplyr::mutate(
+    change = estimate.m7 - estimate.m8,
+    twenty_percent = abs(estimate.m7) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+print(m1m2)
+```
+
+```{r Model 9, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m9 <- glm(EDrevisit7 ~ `pt_sex`+ `triage`+ `time_stretcher_hrs`+ `Visits365`+ `pt_residence`+ `cg_residence`, 
+    family = "binomial", data = r1)
+summary(m9)
+lrtest(m8, m9)
+
+m8_summary <- as.data.frame(broom::tidy(m8))
+m9_summary <- as.data.frame(broom::tidy(m9))
+
+m1m2 <- dplyr::left_join(
+  m8_summary,
+  m9_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m8", ".m9")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m8, estimate.m9) %>%
+  dplyr::mutate(
+    change = estimate.m8 - estimate.m9,
+    twenty_percent = abs(estimate.m8) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+print(m1m2)
+```
+
+```{r Model 10, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m10 <- glm(EDrevisit7 ~ `pt_sex`+ `triage`+ `Visits365`+ `pt_residence`+ `cg_residence`, 
+    family = "binomial", data = r1)
+summary(m10)
+lrtest(m9, m10)
+
+m9_summary <- as.data.frame(broom::tidy(m9))
+m10_summary <- as.data.frame(broom::tidy(m10))
+
+m1m2 <- dplyr::left_join(
+  m9_summary,
+  m10_summary,
+  by = 'term',
+  copy = FALSE,
+  suffix = c(".m9", ".m10")
+)
+
+m1m2 <- m1m2 %>%
+  dplyr::select(term, estimate.m9, estimate.m10) %>%
+  dplyr::mutate(
+    change = estimate.m9 - estimate.m10,
+    twenty_percent = abs(estimate.m9) * 0.2,
+    beta_changed = if_else(abs(change) >= twenty_percent, TRUE, FALSE)
+  )
+print(m1m2)
+```
+
+```{r Compare models, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+models <- list(m2, m3, m4, m5, m6, m7, m8, m9, m10)
+summaries <- lapply(models, summary)
+summaries 
+# m8 had the best AIC
+# Likelihood Ratio Tests
+lrtest(m8, m10)
+lrtest(base_model, m10) 
+lrtest(empty_model, m10)
+```
+
+## Step 4. Add variables back into the model
+
+```{r Check none are missing, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+used <- c('zbi_score', 'pt_sex', 'pt_age', 'arrival_method', 'triage', 'time_stretcher_hrs', 'transport', 'hospital', 'provenance', 'Visits365', 'period', 'cg_education', 'pt_residence', 'cg_residence')
+
+#not used
+vars <- c("soutien_social", "cg_sex", "med_fam", "rv_med_fam", "charlson_score_adj", "transport", "pt_education", "cg_pt_relation", "pt_revenue", "cg_revenue")      
+
+ma <- glm(EDrevisit7 ~ pt_sex + triage + time_stretcher_hrs + Visits365 + 
+    pt_residence + cg_residence + cg_education, family = "binomial", data = r)
+
+model_list <- list()
+
+### Run the models one by one, adding one of the vars as a predictor each time
+for (i in seq_along(vars)) {
+  formula <- as.formula(paste("EDrevisit7 ~ pt_sex + triage + time_stretcher_hrs + Visits365 + 
+    pt_residence + cg_residence + cg_education +", vars[i]))
+  model <- glm(formula, data = r, family = "binomial")
+  assign(paste0("ma", i), model)
+}
+
+### Print the model summaries with the Wald Tests
+for (i in seq_along(vars)) {
+  model_name <- paste0("ma", i)
+  model_summary <- summary(get(model_name))
+  print(paste("Summary for", model_name))
+  print(model_summary)
+}
+
+### Likelihood Ratio Tests
+for (i in seq_along(vars)) {
+  model_name <- paste0("ma", i)
+  model_summary <- lrtest(m9, get(model_name))
+  print(paste("LRT Result for", model_name))
+  print(model_summary)
+}
+```
+## Step 5. Check Assumptions of linearity
+
+For each continuous variable in this model we must check the assumption that the logit increases/decreases linearly as a function of the covariate.
+
+```{r Assumption of linearity, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+### Scatterplots
+# Run logistic regression model
+logit_model <- m10
+
+# Save logit scores as a new variable in the dataset
+r1$logit_scores <- predict(logit_model, type = "link")
+
+# Create scatterplots for each continuous IV against logit scores
+par(mfrow = c(2, ceiling(length(c('Visits365', 'zbi_score'))/2)), mar = c(3, 3, 2, 1))
+
+for (iv in c('Visits365', 'zbi_score')) {
+  plot(r1[[iv]], r1$logit_scores, main = paste("Scatterplot of", iv, "against Logit Scores"), xlab = iv, ylab = "Logit Scores")
+}
+```
+## Step 6. Look for interactions
+
+The next step in the purposeful selection procedure is to explore possible interactions among the main effects. Each pair of main effects should represent a plausible interaction. Hence, we fit models that individually added possible interactions to the main effects model.
+
+An interaction between two variables implies that the effect of each variable is not constant over levels of the other variable.
+
+In the textbook, they specify this threshold as .10 when looking for interactions, and then as .05 when evaluating them.  
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int <- glm(EDrevisit7 ~ pt_sex + triage + time_stretcher_hrs + Visits365 + 
+    pt_residence + cg_residence, 
+    family = "binomial", data = r1)
+summary(m_int)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int2 <- glm(EDrevisit7 ~ pt_sex*period + triage*period + time_stretcher_hrs*period + Visits365*period + 
+    pt_residence*period + cg_residence*period, 
+    family = "binomial", data = r1)
+summary(m_int2)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int3 <- glm(EDrevisit7 ~ triage*pt_sex + time_stretcher_hrs*pt_sex + Visits365*pt_sex + 
+    pt_residence*pt_sex + cg_residence*pt_sex, 
+    family = "binomial", data = r1)
+summary(m_int3)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int4 <- glm(EDrevisit7 ~ pt_sex*triage + time_stretcher_hrs*triage + Visits365*triage + 
+    pt_residence*triage + cg_residence*triage, 
+    family = "binomial", data = r1)
+summary(m_int4)
+# triage * Visits365
+```
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int5 <- glm(EDrevisit7 ~ triage*time_stretcher_hrs + pt_sex*time_stretcher_hrs  + Visits365*time_stretcher_hrs + pt_residence*time_stretcher_hrs + cg_residence*time_stretcher_hrs, 
+    family = "binomial", data = r1)
+summary(m_int5)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int6 <- glm(EDrevisit7 ~ Visits365*time_stretcher_hrs + Visits365*pt_sex + Visits365*time_stretcher_hrs + Visits365*pt_residence + Visits365*cg_residence + Visits365*triage, 
+    family = "binomial", data = r1)
+summary(m_int6)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int7 <- glm(EDrevisit7 ~ pt_residence*time_stretcher_hrs + pt_residence*pt_sex + pt_residence*time_stretcher_hrs + Visits365*pt_residence + pt_residence*cg_residence + pt_residence*triage, 
+    family = "binomial", data = r1)
+summary(m_int7)
+```
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_int8 <- glm(EDrevisit7 ~ cg_residence*time_stretcher_hrs + cg_residence*pt_sex + cg_residence*time_stretcher_hrs + Visits365*cg_residence + pt_residence*cg_residence + cg_residence*triage, 
+    family = "binomial", data = r1)
+summary(m_int8)
+```
+
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+m_intF <- glm(EDrevisit7 ~ pt_sex + zbi_score + time_stretcher_hrs + Visits365 + 
+    pt_residence + cg_residence + triage,
+    family = "binomial", data = r1)
+summary(m_intF)
+```
+
+## Step 7. Assess Goodness of Fit ##
+
+In the Hosmer-Lemeshow model, a large value of Chi-squared (with small p-value \< 0.05) indicates poor fit and small Chi-squared values (with larger p-value closer to 1) indicate a good logistic regression model fit.
+
+The g in the formula represents the groups, such that g = 10 means we are splitting the data into 10 groups based on their predicted probabilities and then, within groups, comparing the observed and expected proportions.
+
+```{r Goodness of fit, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+library(ResourceSelection)
+# Check the model fit across all the individuals
+fit <- m_intF$fitted
+hist(fit)
+summary(m_intF)
+
+### Method 1: Do it by hand!
+# Calculate the residuals
+# Sum of squares of these residuals follows a chi-square with 1406 df
+
+r <- (r1$EDrevisit7-fit)/(sqrt(fit*(1-fit)))
+sum(r^2)
+1-pchisq(sum(r^2), df=1398) # not significant
+
+### Method 2 for Goodness of Fit: 
+hl_gof <- hoslem.test(r1$EDrevisit7, fitted(m_intF), g = 10)
+hl_gof
+```
+So model M10 is the final adjusted model predicting 7 day revisits. 
+
+```{r C-Statistic and ROC curve, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+library(DescTools)
+library(pROC)
+Cstat(m_intF)
+
+summary(m_intF)
+predictions <- predict(m_intF, type = "response")
+roc(r1$EDrevisit7, predictions)
+
+# Roc Curve
+
+roc7 <- ggroc(roc(r1$EDrevisit7, predictions), colour = "blue") +
+  theme_minimal() + 
+  ggtitle("") + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="gray", linetype="dashed")
+
+# C statistics
+survival::concordance(m_intF)
+```
+
+```{r Stepwise, tidy=TRUE, tidy.opts=list(width.cutoff=50)}
+full.fit <- glm(EDrevisit7 ~., data=r1, family = binomial)
+step.fit <- MASS::stepAIC(full.fit, direction = 'both', trace = F)
+summary(step.fit)
+```
+
+```{r}
+#save(roc7, file = "roc7.RData")
+```
+
