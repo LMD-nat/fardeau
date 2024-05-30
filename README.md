@@ -2,6 +2,8 @@
 
 Fardeau is the project name for my MSc project, entitled *L’influence du fardeau des proches aidants sur l’utilisation des services d’urgence par les   personnes aînées en transition de soins : une étude observationnelle à méthodes mixtes*. 
 
+Article en progrès [https://docs.google.com/document/d/1KnmNwqBfXnR9HlzJk9Jb31X_ZChDarot_jtmEVN3QDk/edit?usp=sharing].  
+
 ## Directory
 
 The relevant files are organized as follows. 
