@@ -10,7 +10,7 @@ The code contains no identifying information. The code contains only variable na
 
 The relevant files are organized as follows. 
 
-`analyses` contains code for the regression models and sensitivity analyses. 
+`analyses` contains code for the regression models and sensitivity analyses. `AllAnalysesNotebook.Rmd` is a notebook containing all of the quantitative analyses for my MSc thesis. 
 
 `clean` contains the code for both the categorization of factor variables and the cleaning of the data as extracted from the medical database. 
 
@@ -20,6 +20,7 @@ The relevant files are organized as follows.
 
 ```bash
 - analyses -
+|_ AllAnalysesNotebook.Rmd
            |_ Poisson Model 30 Day Revisits.R
            |_ Seven Day Revisit Models.Rmd
            |_ Thirty Day Admission Models.Rmd
